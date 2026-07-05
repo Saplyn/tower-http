@@ -384,12 +384,13 @@
 //! [`ServerErrorsAsFailures`]: crate::classify::ServerErrorsAsFailures
 //! [`Body::poll_frame`]: http_body::Body::poll_frame
 
-use std::{fmt, time::Duration};
+use std::fmt;
 
 use tracing::Level;
 
 pub use self::{
     body::ResponseBody,
+    clock::{Clock, DefaultClock, DurationExt},
     future::ResponseFuture,
     layer::TraceLayer,
     make_span::{DefaultMakeSpan, MakeSpan},
@@ -459,6 +460,7 @@ macro_rules! event_dynamic_lvl {
 }
 
 mod body;
+mod clock;
 mod future;
 mod layer;
 mod make_span;
@@ -472,12 +474,12 @@ mod service;
 const DEFAULT_MESSAGE_LEVEL: Level = Level::DEBUG;
 const DEFAULT_ERROR_LEVEL: Level = Level::ERROR;
 
-struct Latency {
+struct Latency<D: DurationExt> {
     unit: LatencyUnit,
-    duration: Duration,
+    duration: D,
 }
 
-impl fmt::Display for Latency {
+impl<D: DurationExt> fmt::Display for Latency<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.unit {
             LatencyUnit::Seconds => write!(f, "{} s", self.duration.as_secs_f64()),
