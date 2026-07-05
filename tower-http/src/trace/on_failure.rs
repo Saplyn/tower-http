@@ -102,13 +102,14 @@ where
         &mut self,
         failure_classification: FailureClass,
         latency: Clk::Duration,
-        _: &Span,
+        span: &Span,
     ) {
         let latency = Latency {
             unit: self.latency_unit,
             duration: latency,
         };
         event_dynamic_lvl!(
+            parent: span,
             self.level,
             classification = %failure_classification,
             %latency,

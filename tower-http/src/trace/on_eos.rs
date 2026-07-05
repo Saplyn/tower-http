@@ -87,7 +87,7 @@ impl DefaultOnEos {
 }
 
 impl<Clk: Clock> OnEos<Clk> for DefaultOnEos {
-    fn on_eos(self, trailers: Option<&HeaderMap>, stream_duration: Clk::Duration, _span: &Span) {
+    fn on_eos(self, trailers: Option<&HeaderMap>, stream_duration: Clk::Duration, span: &Span) {
         let stream_duration = Latency {
             unit: self.latency_unit,
             duration: stream_duration,
@@ -103,6 +103,6 @@ impl<Clk: Clock> OnEos<Clk> for DefaultOnEos {
             }
         });
 
-        event_dynamic_lvl!(self.level, %stream_duration, status, "end of stream");
+        event_dynamic_lvl!(parent: span, self.level, %stream_duration, status, "end of stream");
     }
 }

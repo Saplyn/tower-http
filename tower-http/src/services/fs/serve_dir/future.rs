@@ -119,8 +119,22 @@ where
                         )));
                     }
 
-                    Ok(OpenFileOutput::NotModified) => {
-                        break Poll::Ready(Ok(response_with_status(StatusCode::NOT_MODIFIED)));
+                    Ok(OpenFileOutput::NotModified {
+                        etag,
+                        last_modified,
+                    }) => {
+                        let mut res = response_with_status(StatusCode::NOT_MODIFIED);
+                        if let Some(etag) = etag {
+                            res.headers_mut()
+                                .insert(header::ETAG, etag.into_header_value());
+                        }
+                        if let Some(last_modified) = last_modified {
+                            res.headers_mut().insert(
+                                header::LAST_MODIFIED,
+                                HeaderValue::from_str(&last_modified.0.to_string()).unwrap(),
+                            );
+                        }
+                        break Poll::Ready(Ok(res));
                     }
 
                     Ok(OpenFileOutput::InvalidRedirectUri) => {
@@ -208,7 +222,7 @@ where
         .map_ok(|response| {
             response
                 .map(|body| {
-                    UnsyncBoxBody::new(
+                    UnsyncBoxBody::from_inner(
                         body.map_err(|err| match err.into().downcast::<io::Error>() {
                             Ok(err) => *err,
                             Err(err) => io::Error::new(io::ErrorKind::Other, err),
@@ -225,8 +239,8 @@ where
 
 fn build_response(output: FileOpened) -> Response<ResponseBody> {
     let (maybe_file, size) = match output.extent {
-        FileRequestExtent::Full(file, meta) => (Some(file), meta.len()),
-        FileRequestExtent::Head(meta) => (None, meta.len()),
+        FileRequestExtent::Full(file, size) => (Some(file), size),
+        FileRequestExtent::Head(size) => (None, size),
     };
 
     let mut builder = Response::builder()
@@ -240,8 +254,18 @@ fn build_response(output: FileOpened) -> Response<ResponseBody> {
         builder = builder.header(header::CONTENT_ENCODING, encoding.into_header_value());
     }
 
+    // Per RFC 9110 §12.5.3, Vary must be sent when the response could differ
+    // based on Accept-Encoding, even if this particular response is uncompressed.
+    if output.precompression_configured {
+        builder = builder.header(header::VARY, "accept-encoding");
+    }
+
     if let Some(last_modified) = output.last_modified {
         builder = builder.header(header::LAST_MODIFIED, last_modified.0.to_string());
+    }
+
+    if let Some(etag) = output.etag {
+        builder = builder.header(header::ETAG, etag.into_header_value());
     }
 
     match output.maybe_range {
@@ -258,7 +282,7 @@ fn build_response(output: FileOpened) -> Response<ResponseBody> {
                 } else {
                     let body = if let Some(file) = maybe_file {
                         let range_size = range.end() - range.start() + 1;
-                        ResponseBody::new(UnsyncBoxBody::new(
+                        ResponseBody::new(UnsyncBoxBody::from_inner(
                             AsyncReadBody::with_capacity_limited(
                                 file,
                                 output.chunk_size,
@@ -306,7 +330,7 @@ fn build_response(output: FileOpened) -> Response<ResponseBody> {
         // Not a range request
         None => {
             let body = if let Some(file) = maybe_file {
-                ResponseBody::new(UnsyncBoxBody::new(
+                ResponseBody::new(UnsyncBoxBody::from_inner(
                     AsyncReadBody::with_capacity(file, output.chunk_size).boxed_unsync(),
                 ))
             } else {
@@ -323,10 +347,10 @@ fn build_response(output: FileOpened) -> Response<ResponseBody> {
 
 fn body_from_bytes(bytes: Bytes) -> ResponseBody {
     let body = Full::from(bytes).map_err(|err| match err {}).boxed_unsync();
-    ResponseBody::new(UnsyncBoxBody::new(body))
+    ResponseBody::new(UnsyncBoxBody::from_inner(body))
 }
 
 fn empty_body() -> ResponseBody {
     let body = Empty::new().map_err(|err| match err {}).boxed_unsync();
-    ResponseBody::new(UnsyncBoxBody::new(body))
+    ResponseBody::new(UnsyncBoxBody::from_inner(body))
 }

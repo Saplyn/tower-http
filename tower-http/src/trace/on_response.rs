@@ -104,7 +104,7 @@ impl DefaultOnResponse {
 }
 
 impl<B, Clk: Clock> OnResponse<B, Clk> for DefaultOnResponse {
-    fn on_response(self, response: &Response<B>, latency: Clk::Duration, _: &Span) {
+    fn on_response(self, response: &Response<B>, latency: Clk::Duration, span: &Span) {
         let latency = Latency {
             unit: self.latency_unit,
             duration: latency,
@@ -114,6 +114,7 @@ impl<B, Clk: Clock> OnResponse<B, Clk> for DefaultOnResponse {
             .then(|| tracing::field::debug(response.headers()));
 
         event_dynamic_lvl!(
+            parent: span,
             self.level,
             %latency,
             status = status(response),

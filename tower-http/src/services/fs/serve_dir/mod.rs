@@ -17,12 +17,15 @@ use std::{
 };
 use tower_service::Service;
 
+mod backend;
 pub(crate) mod future;
 mod headers;
 mod open_file;
 
 #[cfg(test)]
 mod tests;
+
+pub use self::backend::{Backend, File, Metadata, TokioBackend, TokioFile};
 
 // default capacity 64KiB
 const DEFAULT_CAPACITY: usize = 65536;
@@ -50,15 +53,17 @@ const DEFAULT_CAPACITY: usize = 65536;
 /// let service = ServeDir::new("assets");
 /// ```
 #[derive(Clone, Debug)]
-pub struct ServeDir<F = DefaultServeDirFallback> {
+pub struct ServeDir<F = DefaultServeDirFallback, B = TokioBackend> {
     base: PathBuf,
+    redirect_path_prefix: String,
     buf_chunk_size: usize,
     precompressed_variants: Option<PrecompressedVariants>,
-    // This is used to specialise implementation for
+    // This is used to specialize implementation for
     // single files
     variant: ServeVariant,
     fallback: Option<F>,
     call_fallback_on_method_not_allowed: bool,
+    backend: B,
 }
 
 impl ServeDir<DefaultServeDirFallback> {
@@ -72,13 +77,16 @@ impl ServeDir<DefaultServeDirFallback> {
 
         Self {
             base,
+            redirect_path_prefix: String::new(),
             buf_chunk_size: DEFAULT_CAPACITY,
             precompressed_variants: None,
             variant: ServeVariant::Directory {
                 append_index_html_on_directories: true,
+                html_as_default_extension: false,
             },
             fallback: None,
             call_fallback_on_method_not_allowed: false,
+            backend: TokioBackend,
         }
     }
 
@@ -88,16 +96,45 @@ impl ServeDir<DefaultServeDirFallback> {
     {
         Self {
             base: path.as_ref().to_owned(),
+            redirect_path_prefix: String::new(),
             buf_chunk_size: DEFAULT_CAPACITY,
             precompressed_variants: None,
             variant: ServeVariant::SingleFile { mime },
             fallback: None,
             call_fallback_on_method_not_allowed: false,
+            backend: TokioBackend,
         }
     }
 }
 
-impl<F> ServeDir<F> {
+impl<B: Backend> ServeDir<DefaultServeDirFallback, B> {
+    /// Create a new [`ServeDir`] with a custom [`Backend`].
+    ///
+    /// This allows serving files from sources other than the local filesystem.
+    pub fn with_backend<P>(path: P, backend: B) -> Self
+    where
+        P: AsRef<Path>,
+    {
+        let mut base = PathBuf::from(".");
+        base.push(path.as_ref());
+
+        ServeDir {
+            base,
+            buf_chunk_size: DEFAULT_CAPACITY,
+            precompressed_variants: None,
+            variant: ServeVariant::Directory {
+                append_index_html_on_directories: true,
+                html_as_default_extension: false,
+            },
+            fallback: None,
+            call_fallback_on_method_not_allowed: false,
+            redirect_path_prefix: String::new(),
+            backend,
+        }
+    }
+}
+
+impl<F, B: Backend> ServeDir<F, B> {
     /// If the requested path is a directory append `index.html`.
     ///
     /// This is useful for static sites.
@@ -107,12 +144,42 @@ impl<F> ServeDir<F> {
         match &mut self.variant {
             ServeVariant::Directory {
                 append_index_html_on_directories,
+                ..
             } => {
                 *append_index_html_on_directories = append;
                 self
             }
             ServeVariant::SingleFile { mime: _ } => self,
         }
+    }
+
+    /// If the requested path doesn't specify a file extension, append `.html`.
+    ///
+    /// Defaults to `false`.
+    pub fn html_as_default_extension(mut self, append: bool) -> Self {
+        match &mut self.variant {
+            ServeVariant::Directory {
+                html_as_default_extension,
+                ..
+            } => {
+                *html_as_default_extension = append;
+                self
+            }
+            ServeVariant::SingleFile { mime: _ } => self,
+        }
+    }
+
+    /// Sets a path to be prepended when performing a trailing slash redirect.
+    ///
+    /// This is useful when you want to serve the files at another location than `/`, for example
+    /// when you are using multiple services and want this instance to handle `/static/<path>`.
+    /// In that example, you should pass in `/static` so that a trailing slash redirect does not
+    /// redirect to `/<path>/` but instead to `/static/<path>/`
+    ///
+    /// The default is the empty string.
+    pub fn redirect_path_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.redirect_path_prefix = prefix.into();
+        self
     }
 
     /// Set a specific read buffer chunk size.
@@ -209,14 +276,16 @@ impl<F> ServeDir<F> {
     ///     // respond with `not_found.html` for missing files
     ///     .fallback(ServeFile::new("assets/not_found.html"));
     /// ```
-    pub fn fallback<F2>(self, new_fallback: F2) -> ServeDir<F2> {
+    pub fn fallback<F2>(self, new_fallback: F2) -> ServeDir<F2, B> {
         ServeDir {
+            redirect_path_prefix: self.redirect_path_prefix,
             base: self.base,
             buf_chunk_size: self.buf_chunk_size,
             precompressed_variants: self.precompressed_variants,
             variant: self.variant,
             fallback: Some(new_fallback),
             call_fallback_on_method_not_allowed: self.call_fallback_on_method_not_allowed,
+            backend: self.backend,
         }
     }
 
@@ -237,7 +306,7 @@ impl<F> ServeDir<F> {
     /// ```
     ///
     /// Setups like this are often found in single page applications.
-    pub fn not_found_service<F2>(self, new_fallback: F2) -> ServeDir<SetStatus<F2>> {
+    pub fn not_found_service<F2>(self, new_fallback: F2) -> ServeDir<SetStatus<F2>, B> {
         self.fallback(SetStatus::new(new_fallback, StatusCode::NOT_FOUND))
     }
 
@@ -278,7 +347,7 @@ impl<F> ServeDir<F> {
     ///     let mut service = ServeDir::new("assets");
     ///
     ///     // You only need to worry about backpressure, and thus call `ServiceExt::ready`, if
-    ///     // your adding a fallback to `ServeDir` that cares about backpressure.
+    ///     // you are adding a fallback to `ServeDir` that cares about backpressure.
     ///     //
     ///     // Its shown here for demonstration but you can do `service.try_call(request)`
     ///     // otherwise
@@ -359,6 +428,8 @@ impl<F> ServeDir<F> {
             }
         };
 
+        let redirect_path_prefix = self.redirect_path_prefix.clone();
+
         let buf_chunk_size = self.buf_chunk_size;
         let range_header = req
             .headers()
@@ -366,33 +437,36 @@ impl<F> ServeDir<F> {
             .and_then(|value| value.to_str().ok())
             .map(|s| s.to_owned());
 
+        let precompression_configured = self.precompressed_variants.is_some();
         let negotiated_encodings: Vec<_> = encodings(
             req.headers(),
             self.precompressed_variants.unwrap_or_default(),
         )
         .collect();
 
-        let variant = self.variant.clone();
-
-        let open_file_future = Box::pin(open_file::open_file(
-            variant,
+        let open_file_future = Box::pin(open_file::open_file(open_file::OpenFileRequest {
+            variant: self.variant.clone(),
+            redirect_path_prefix,
             path_to_file,
             req,
             negotiated_encodings,
             range_header,
             buf_chunk_size,
-        ));
+            precompression_configured,
+            backend: self.backend.clone(),
+        }));
 
         ResponseFuture::open_file_future(open_file_future, fallback_and_request)
     }
 }
 
-impl<ReqBody, F, FResBody> Service<Request<ReqBody>> for ServeDir<F>
+impl<ReqBody, F, FResBody, B> Service<Request<ReqBody>> for ServeDir<F, B>
 where
     F: Service<Request<ReqBody>, Response = Response<FResBody>, Error = Infallible> + Clone,
     F::Future: Send + 'static,
     FResBody: http_body::Body<Data = Bytes> + Send + 'static,
     FResBody::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    B: Backend,
 {
     type Response = Response<ResponseBody>;
     type Error = Infallible;
@@ -415,7 +489,7 @@ where
                     #[cfg(feature = "tracing")]
                     tracing::error!(error = %_err, "Failed to read file");
 
-                    let body = ResponseBody::new(UnsyncBoxBody::new(
+                    let body = ResponseBody::new(UnsyncBoxBody::from_inner(
                         Empty::new().map_err(|err| match err {}).boxed_unsync(),
                     ));
                     Response::builder()
@@ -445,6 +519,7 @@ opaque_future! {
 enum ServeVariant {
     Directory {
         append_index_html_on_directories: bool,
+        html_as_default_extension: bool,
     },
     SingleFile {
         mime: HeaderValue,
@@ -456,6 +531,7 @@ impl ServeVariant {
         match self {
             ServeVariant::Directory {
                 append_index_html_on_directories: _,
+                html_as_default_extension: _,
             } => {
                 let path = requested_path.trim_start_matches('/');
 
@@ -611,6 +687,12 @@ opaque_body! {
     /// Response body for [`ServeDir`] and [`ServeFile`][super::ServeFile].
     #[derive(Default)]
     pub type ResponseBody = UnsyncBoxBody<Bytes, io::Error>;
+}
+
+impl From<ResponseBody> for UnsyncBoxBody<Bytes, io::Error> {
+    fn from(body: ResponseBody) -> Self {
+        body.inner
+    }
 }
 
 /// The default fallback service used with [`ServeDir`].
